@@ -11,7 +11,7 @@
  *
  * Design notes: docs/sync-logic.md § Semantic JSON Merge
  *
- * Future extension points (tracked in .fitattributes FR):
+ * Future extension points (tracked in #337 — .fitattributes):
  * - Order-significance selectors (opt arrays IN to ordered/index-based merge)
  * - Field exclusion selectors (ignore specific JSON paths during comparison)
  * - Text-mode policy (always-local, always-remote, clash) for non-JSON files
@@ -31,7 +31,7 @@ export interface JsonMergeSpec {
 	 * Example: { "nodes": "id", "edges": "id" }
 	 *
 	 * Paths are relative to the root object. Nested paths not yet supported
-	 * (deferred to .fitattributes implementation).
+	 * (deferred to #337 — .fitattributes).
 	 */
 	keyedArrays: Record<string, string>;
 }
@@ -44,10 +44,15 @@ export type MergeResult =
 /**
  * Merge two JSON strings using the given spec.
  *
+ * @param baseText   - Base file content (content at last sync); null if unavailable
  * @param localText  - Local file content (UTF-8 JSON string)
  * @param remoteText - Remote file content (UTF-8 JSON string)
  * @param spec       - Merge spec describing keyed arrays and exclusions
- * @returns MergeResult: merged JSON string on success, or reason for failure
+ * @returns MergeResult: merged value on success, or reason for failure
+ *
+ * When baseText is null, one-sided key/array presence is treated as unknown-intent
+ * and falls back to merged:false (conservative). When baseText is provided, the
+ * base is used to distinguish additions from deletions.
  */
 export function mergeJson(
 	baseText: string | null,
@@ -68,16 +73,20 @@ export function mergeJson(
 		return { merged: false, reason: 'remote content is not valid JSON' };
 	}
 
+	let base: unknown = null;
+	if (baseText !== null) {
+		try {
+			base = JSON.parse(baseText);
+		} catch {
+			base = null; // unparseable base → fall back to no-base behaviour
+		}
+	}
+
 	if (typeof local !== 'object' || local === null || Array.isArray(local)) {
 		return { merged: false, reason: 'local JSON root is not an object' };
 	}
 	if (typeof remote !== 'object' || remote === null || Array.isArray(remote)) {
 		return { merged: false, reason: 'remote JSON root is not an object' };
-	}
-
-	let base: unknown = null;
-	if (baseText !== null) {
-		try { base = JSON.parse(baseText); } catch { /* unparseable base → no-base behaviour */ }
 	}
 	const baseObj = (typeof base === 'object' && base !== null && !Array.isArray(base))
 		? base as Record<string, unknown>
@@ -100,8 +109,9 @@ type ArrayMergeResult =
  * - Keys in spec.keyedArrays → id-keyed set merge
  * - Other keys present in both, equal → include unchanged
  * - Other keys present in both, different → conflict (merged: false); no silent data loss
- * - Keys/arrays present on only one side → conflict (no base available to distinguish addition from deletion)
- *   Base-aware three-way resolution is implemented in the next PR (powpvpwx).
+ * - Keys present in only one side:
+ *   - base provided: check whether the absent side deleted it or the present side added it
+ *   - base null: unknown intent → conflict (conservative)
  */
 function mergeObjects(
 	base: Record<string, unknown> | null,
@@ -110,13 +120,17 @@ function mergeObjects(
 	spec: JsonMergeSpec,
 ): MergeResult {
 	const result: Record<string, unknown> = {};
-	const allKeys = new Set([...Object.keys(local), ...Object.keys(remote)]);
+	const allKeys = new Set([
+		...Object.keys(local),
+		...Object.keys(remote),
+		...(base ? Object.keys(base) : []),
+	]);
 
 	for (const key of allKeys) {
-		if (key in spec.keyedArrays) continue; // handled below
+		if (Object.prototype.hasOwnProperty.call(spec.keyedArrays, key)) continue; // handled below
 
-		const inLocal = key in local;
-		const inRemote = key in remote;
+		const inLocal = Object.prototype.hasOwnProperty.call(local, key);
+		const inRemote = Object.prototype.hasOwnProperty.call(remote, key);
 
 		if (inLocal && inRemote) {
 			if (!deepEqual(local[key], remote[key])) {
@@ -124,8 +138,24 @@ function mergeObjects(
 			}
 			result[key] = remote[key];
 		} else if (inLocal !== inRemote) {
-			return { merged: false, reason: `ambiguous one-sided presence of key "${key}" (no merge base available)` };
+			// One side has the key, the other doesn't
+			if (base === null) {
+				// Can't distinguish addition from deletion without base
+				return { merged: false, reason: `ambiguous one-sided presence of key "${key}" (no base available)` };
+			}
+			const inBase = Object.prototype.hasOwnProperty.call(base, key);
+			if (!inBase) {
+				// Key is new on one side → addition, include it
+				result[key] = inLocal ? local[key] : remote[key];
+			} else if (inLocal) {
+				// Remote deleted it, local kept it → conflict
+				return { merged: false, reason: `remote deleted key "${key}" but local still has it` };
+			} else {
+				// Local deleted it, remote kept it → conflict
+				return { merged: false, reason: `local deleted key "${key}" but remote still has it` };
+			}
 		}
+		// key in neither local nor remote (was in base, both deleted) → omit from result
 	}
 
 	for (const [path, idKey] of Object.entries(spec.keyedArrays)) {
@@ -133,13 +163,35 @@ function mergeObjects(
 		const key = path;
 		const localArr = local[key];
 		const remoteArr = remote[key];
+		const baseArr = base?.[key];
 
-		if (!Array.isArray(remoteArr) && !Array.isArray(localArr)) continue;
-		if (!Array.isArray(remoteArr) || !Array.isArray(localArr)) {
-			return { merged: false, reason: `ambiguous one-sided presence of array "${key}" (no merge base available)` };
+		const localHas = Array.isArray(localArr);
+		const remoteHas = Array.isArray(remoteArr);
+
+		if (!localHas && !remoteHas) continue;
+
+		if (localHas !== remoteHas) {
+			// One side missing the array entirely
+			if (base === null) {
+				return { merged: false, reason: `ambiguous one-sided presence of array "${key}" (no base available)` };
+			}
+			const baseHas = Array.isArray(baseArr);
+			if (!baseHas) {
+				// New on one side → addition
+				result[key] = localHas ? localArr : remoteArr;
+			} else {
+				// One side deleted the array entirely → conflict
+				return { merged: false, reason: `one side deleted array "${key}" entirely` };
+			}
+			continue;
 		}
 
-		const arrayResult = mergeKeyedArrays(localArr, remoteArr, idKey);
+		const arrayResult = mergeKeyedArrays(
+			localArr as unknown[],
+			remoteArr as unknown[],
+			Array.isArray(baseArr) ? baseArr as unknown[] : undefined,
+			idKey,
+		);
 		if (!arrayResult.ok) {
 			return { merged: false, reason: `conflicting edits to element with ${idKey}=${String(arrayResult.conflictId)} in "${key}"` };
 		}
@@ -150,40 +202,63 @@ function mergeObjects(
 }
 
 /**
- * Merge two arrays as id-keyed sets.
+ * Merge two arrays as id-keyed sets with optional three-way resolution.
  *
- * Algorithm:
- * 1. Start with remote array in remote order
- * 2. Append local-only items (items whose id key is absent from remote)
- * 3. If same id exists in both but content differs → conflict (caller falls back to clash file)
+ * Remote order is preserved. Local-only items (ids absent from remote) are appended.
+ * For same-id items with differing content, three-way resolution is attempted when
+ * base is available: if only one side changed, that side wins; if both changed, conflict.
+ * With no base, any same-id difference is a conflict (two-way fallback).
  *
  * Items without the id key field are kept from remote only (conservative).
  */
 function mergeKeyedArrays(
 	local: unknown[],
 	remote: unknown[],
+	base: unknown[] | undefined,
 	idKey: string,
 ): ArrayMergeResult {
-	const remoteById = new Map<unknown, unknown>();
-	for (const item of remote) {
-		if (isObject(item) && idKey in item) {
-			remoteById.set((item as Record<string, unknown>)[idKey], item);
-		}
-	}
+	const hasId = (item: unknown): item is Record<string, unknown> =>
+		isObject(item) && Object.prototype.hasOwnProperty.call(item, idKey);
 
-	const localOnly: unknown[] = [];
+	const localById = new Map<unknown, unknown>();
 	for (const item of local) {
-		if (!isObject(item)) continue;
-		const id = (item as Record<string, unknown>)[idKey];
-		if (id === undefined) continue;
-		if (!remoteById.has(id)) {
-			localOnly.push(item);
-		} else if (!deepEqual(item, remoteById.get(id))) {
-			return { ok: false, conflictId: id };
+		if (hasId(item)) localById.set(item[idKey], item);
+	}
+
+	const baseById = new Map<unknown, unknown>();
+	if (base !== undefined) {
+		for (const item of base) {
+			if (hasId(item)) baseById.set(item[idKey], item);
 		}
 	}
 
-	return { ok: true, value: [...remote, ...localOnly] };
+	const seenIds = new Set<unknown>();
+	const result: unknown[] = [];
+
+	for (const remoteItem of remote) {
+		if (!hasId(remoteItem)) { result.push(remoteItem); continue; }
+		const id = remoteItem[idKey];
+		seenIds.add(id);
+		const localItem = localById.get(id);
+		if (localItem === undefined || deepEqual(localItem, remoteItem)) {
+			result.push(remoteItem);
+			continue;
+		}
+		// Same id, different content — attempt three-way resolution
+		const baseItem = baseById.get(id);
+		if (baseItem !== undefined) {
+			if (deepEqual(baseItem, remoteItem)) { result.push(localItem); continue; } // remote unchanged → local wins
+			if (deepEqual(baseItem, localItem))  { result.push(remoteItem); continue; } // local unchanged → remote wins
+		}
+		return { ok: false, conflictId: id }; // no base or genuine divergence
+	}
+
+	for (const item of local) {
+		if (!hasId(item)) continue;
+		if (!seenIds.has(item[idKey])) result.push(item);
+	}
+
+	return { ok: true, value: result };
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

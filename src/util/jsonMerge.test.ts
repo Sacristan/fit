@@ -59,6 +59,30 @@ describe('mergeJson', () => {
 			expect(result).toMatchObject({ merged: false, reason: expect.stringContaining('a') });
 		});
 
+		it('three-way: remote unchanged from base → local edit wins', () => {
+			const base = JSON.stringify({ items: [{ id: 'a', val: 'base' }] });
+			const local = JSON.stringify({ items: [{ id: 'a', val: 'local' }] });
+			const remote = JSON.stringify({ items: [{ id: 'a', val: 'base' }] }); // remote unchanged
+			const result = mergeJson(base, local, remote, spec);
+			expect(result).toEqual({ merged: true, value: { items: [{ id: 'a', val: 'local' }] } });
+		});
+
+		it('three-way: local unchanged from base → remote edit wins', () => {
+			const base = JSON.stringify({ items: [{ id: 'a', val: 'base' }] });
+			const local = JSON.stringify({ items: [{ id: 'a', val: 'base' }] }); // local unchanged
+			const remote = JSON.stringify({ items: [{ id: 'a', val: 'remote' }] });
+			const result = mergeJson(base, local, remote, spec);
+			expect(result).toEqual({ merged: true, value: { items: [{ id: 'a', val: 'remote' }] } });
+		});
+
+		it('three-way: both sides changed same item → genuine conflict', () => {
+			const base = JSON.stringify({ items: [{ id: 'a', val: 'base' }] });
+			const local = JSON.stringify({ items: [{ id: 'a', val: 'local' }] });
+			const remote = JSON.stringify({ items: [{ id: 'a', val: 'remote' }] });
+			const result = mergeJson(base, local, remote, spec);
+			expect(result).toMatchObject({ merged: false, reason: expect.stringContaining('a') });
+		});
+
 		it('same-id with identical content is not a conflict', () => {
 			const local = JSON.stringify({ items: [{ id: 'a', val: 'same' }] });
 			const remote = JSON.stringify({ items: [{ id: 'a', val: 'same' }] });
@@ -124,11 +148,43 @@ describe('mergeJson', () => {
 			expect(result).toMatchObject({ merged: false, reason: expect.stringContaining('items') });
 		});
 
+		it('one-sided keyed array with base confirms new addition, includes it', () => {
+			const base = JSON.stringify({});
+			const local = JSON.stringify({ items: [{ id: 'a' }] });
+			const remote = JSON.stringify({});
+			const result = mergeJson(base, local, remote, spec);
+			expect(result).toEqual({ merged: true, value: { items: [{ id: 'a' }] } });
+		});
+
 		it('remote-only keyed array without base falls back (ambiguous addition vs deletion)', () => {
 			const local = JSON.stringify({});
 			const remote = JSON.stringify({ items: [{ id: 'a' }] });
 			const result = mergeJson(null, local, remote, spec);
 			expect(result).toMatchObject({ merged: false, reason: expect.stringContaining('items') });
+		});
+
+		it('remote-only keyed array with base confirms new addition, includes it', () => {
+			const base = JSON.stringify({});
+			const local = JSON.stringify({});
+			const remote = JSON.stringify({ items: [{ id: 'a' }] });
+			const result = mergeJson(base, local, remote, spec);
+			expect(result).toEqual({ merged: true, value: { items: [{ id: 'a' }] } });
+		});
+
+		it('non-keyed key deleted by both sides is omitted from result', () => {
+			const base = JSON.stringify({ staleKey: 'old' });
+			const local = JSON.stringify({});
+			const remote = JSON.stringify({});
+			const result = mergeJson(base, local, remote, spec);
+			expect(result).toEqual({ merged: true, value: {} });
+		});
+
+		it('non-keyed key conflict is still a clash when base is provided', () => {
+			const base = JSON.stringify({ key: 'original' });
+			const local = JSON.stringify({ key: 'local-edit' });
+			const remote = JSON.stringify({ key: 'remote-edit' });
+			const result = mergeJson(base, local, remote, spec);
+			expect(result).toMatchObject({ merged: false, reason: expect.stringContaining('key') });
 		});
 	});
 
