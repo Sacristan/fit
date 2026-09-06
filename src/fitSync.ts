@@ -565,7 +565,7 @@ export class FitSync implements IFitSync {
 				// and toPlainText()'s fatal UTF-8 decode alone isn't a strong enough
 				// binary signal — some binary content can coincidentally decode as
 				// valid UTF-8, which would let it through to be line-spliced and corrupted.
-				if (hasNullByte(remoteContent.toBytes()) || hasNullByte(localContent.toBytes())) return;
+				if (hasNullByte(remoteContent.prefixBytes(8192)) || hasNullByte(localContent.prefixBytes(8192))) return;
 
 				// Base fetch happens here (lazily, per candidate that passed the checks
 				// above) rather than upfront for every candidate, to avoid a wasted
