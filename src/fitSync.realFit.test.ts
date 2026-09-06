@@ -2895,5 +2895,33 @@ describe('FitSync', () => {
 			expect(localVault.getAllFilesAsRaw()).toHaveProperty('_fit/image.png');
 			expect(localStoreState.pendingClashes).toContain('image.png');
 		});
+
+		it('does not merge binary content that happens to decode as valid UTF-8 (null byte present)', async () => {
+			// A null byte (U+0000) is itself valid UTF-8, so TextDecoder's fatal decode
+			// alone would NOT reject this content — the explicit null-byte check is what
+			// catches it. Regression test for the gap where relying solely on the
+			// decode-throw would have let this through to be line-spliced and corrupted.
+			const fitSync = createFitSync();
+			const base = new Uint8Array([0x00, 0x41, 0x42, 0x43]).buffer; // NUL + 'ABC'
+			localVault.setFile('data.bin', FileContent.fromArrayBuffer(base, 'base64'));
+			await remoteVault.setFile('data.bin', FileContent.fromArrayBuffer(base, 'base64'));
+			const remoteResult = await remoteVault.readFromSource();
+			const localResult = await localVault.readFromSource();
+			fitSync.fit.loadLocalStore(makeLocalStore({
+				localShas: localResult.state,
+				lastFetchedRemoteShas: remoteResult.state,
+				lastFetchedCommitSha: remoteResult.commitSha,
+			}));
+
+			const localEdit = new Uint8Array([0x00, 0x41, 0x42, 0x44]).buffer; // NUL + 'ABD'
+			const remoteEdit = new Uint8Array([0x00, 0x41, 0x45, 0x43]).buffer; // NUL + 'AEC'
+			localVault.setFile('data.bin', FileContent.fromArrayBuffer(localEdit, 'base64'));
+			await remoteVault.setFile('data.bin', FileContent.fromArrayBuffer(remoteEdit, 'base64'));
+
+			const result = await syncAndHandleResult(fitSync, createMockNotice());
+			expect(result).toEqual(expect.objectContaining({ success: true }));
+			expect(localVault.getAllFilesAsRaw()).toHaveProperty('_fit/data.bin');
+			expect(localStoreState.pendingClashes).toContain('data.bin');
+		});
 	});
 });

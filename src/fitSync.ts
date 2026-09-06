@@ -13,6 +13,7 @@ import * as Encryption from "./encryption";
 import { buildStatusExplanation, StatusExplanation, SyncStatusSnapshot } from '@/fitStatusExplainer';
 import { CANVAS_MERGE_SPEC, mergeJson, serialiseMerged, MergeResult } from './util/jsonMerge';
 import { tryLineMerge } from './util/lineMerge';
+import { hasNullByte } from './util/obsidianHelpers';
 
 // Helper to log SHA cache updates with provenance tracking
 function logCacheUpdate(
@@ -547,28 +548,39 @@ export class FitSync implements IFitSync {
 			.filter(c => !pendingReminderPaths.has(c.path))
 			.filter(c => !c.path.endsWith('.canvas'));
 
-		const textBaseContents = new Map<string, string | null>();
-		await Promise.all(textClashCandidates.map(async (clash) => {
-			const baseSha = this.fit.lastFetchedRemoteShas[clash.path];
-			if (!baseSha) { textBaseContents.set(clash.path, null); return; }
-			try {
-				const content = await this.fit.remoteVault.readFileBlobBySha(baseSha);
-				textBaseContents.set(clash.path, content.toPlainText());
-			} catch (e) {
-				fitLogger.log('... [FitSync] Base blob fetch failed for text merge, falling back to clash', { path: clash.path, sha: baseSha, error: String(e) });
-				textBaseContents.set(clash.path, null);
-			}
-		}));
-
 		const autoMergedTextClashes: Array<{path: string, content: FileContent}> = [];
+		// Cache remote content read here so clashFiles (below) doesn't re-fetch it
+		// for candidates that don't end up merging.
+		const textRemoteContents = new Map<string, FileContent>();
 
 		await Promise.all(
 			textClashCandidates.map(async (clash) => {
 				const remoteContent = await this.fit.remoteVault.readFileContent(clash.path).catch(() => null);
 				const localContent = await this.fit.localVault.readFileContent(clash.path).catch(() => null);
 				if (remoteContent === null || localContent === null) return;
-				const baseText = textBaseContents.get(clash.path) ?? null;
-				if (baseText === null) return;
+				textRemoteContents.set(clash.path, remoteContent);
+
+				// Null-byte check first: encoding tags can't be trusted here (remote
+				// content always arrives base64-tagged regardless of underlying type),
+				// and toPlainText()'s fatal UTF-8 decode alone isn't a strong enough
+				// binary signal — some binary content can coincidentally decode as
+				// valid UTF-8, which would let it through to be line-spliced and corrupted.
+				if (hasNullByte(remoteContent.toBytes()) || hasNullByte(localContent.toBytes())) return;
+
+				// Base fetch happens here (lazily, per candidate that passed the checks
+				// above) rather than upfront for every candidate, to avoid a wasted
+				// GitHub API call for paths that were never going to merge anyway.
+				const baseSha = this.fit.lastFetchedRemoteShas[clash.path];
+				if (!baseSha) return;
+				let baseText: string;
+				try {
+					const baseContent = await this.fit.remoteVault.readFileBlobBySha(baseSha);
+					baseText = baseContent.toPlainText();
+				} catch (e) {
+					fitLogger.log('... [FitSync] Base blob fetch failed for text merge, falling back to clash', { path: clash.path, sha: baseSha, error: String(e) });
+					return;
+				}
+
 				let merged: string | null;
 				try {
 					merged = tryLineMerge(baseText, localContent.toPlainText(), remoteContent.toPlainText());
@@ -592,7 +604,7 @@ export class FitSync implements IFitSync {
 				.filter(c => !pendingReminderPaths.has(c.path))
 				.filter(c => !mergedPaths.has(c.path))
 				.map(async (clash) => {
-					const content = await this.fit.remoteVault.readFileContent(clash.path);
+					const content = textRemoteContents.get(clash.path) ?? await this.fit.remoteVault.readFileContent(clash.path);
 					return this.prepareConflictFile(clash.path, content.toBase64());
 				})
 		);
