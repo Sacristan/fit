@@ -727,7 +727,32 @@ Canvas merge is the first use of the merge engine. #337 will add a `.fitattribut
 - Field exclusion selectors (ignore specific JSON paths during comparison) — required for #67
 - Text-mode policies (`always-local`, `always-remote`) for non-JSON files
 
-Until #337 is implemented, only `.canvas` files use semantic merge.
+Until #337 is implemented, `.canvas` is the only file type with structure-aware semantic merge. All other clashing files (including plain text and non-canvas JSON) are eligible for the simpler append-merge below.
+
+## Text Append-Merge
+
+A minimal three-way merge for everything else: auto-merges a clash when both local and remote only *appended* content after a shared base, without needing a real diff algorithm. This covers the most common non-canvas conflict — two devices appending different entries to the same running note (journal, meeting log, shared TODO list) — while anything else (an edit to existing content, a deletion, a reorder) falls back to the standard `_fit/` clash file, unchanged from before this feature existed.
+
+**Merge rule:** given `base` (fetched the same way as the canvas merge base — `lastFetchedRemoteShas[path]` blob SHA), `local`, and `remote`:
+- If `local === remote` (byte-identical), no conflict — return either.
+- If both `local` and `remote` start with `base`, the merge is `base + local's addition + remote's addition`.
+- Otherwise (something other than a pure append happened on at least one side) → not eligible, falls back to `_fit/`.
+
+```typescript
+function tryAppendMerge(base: string, local: string, remote: string): string | null {
+  if (local === remote) return local;
+  if (!local.startsWith(base) || !remote.startsWith(base)) return null;
+  return base + local.slice(base.length) + remote.slice(base.length);
+}
+```
+
+**Binary files:** never merged. `.toPlainText()` throws on non-UTF-8 content (the same fatal-`TextDecoder` guard used elsewhere), and that throw is caught per-file, falling back to `_fit/` exactly like today — no separate binary/text check needed, since remote content always arrives base64-encoded regardless of underlying type (matching GitHub's blob API), so an encoding check can't distinguish binary from text on its own.
+
+**No base available:** (fetch failure, or first clash for a path with no prior sync) → not eligible, falls back to `_fit/`, same as canvas's two-way fallback.
+
+**Result:** merged content written to the local file, SHA stored in baseline, path excluded from `pendingClashes` — same observable behavior as a successful canvas merge.
+
+**Implementation:** [`src/util/textMerge.ts`](../src/util/textMerge.ts) (`tryAppendMerge`), [`src/fitSync.ts`](../src/fitSync.ts) (base pre-fetch + auto-merge block, alongside the canvas merge block, before `clashFiles` computation)
 
 ## Explain Sync Status
 
