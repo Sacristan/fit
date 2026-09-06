@@ -727,7 +727,34 @@ Canvas merge is the first use of the merge engine. #337 will add a `.fitattribut
 - Field exclusion selectors (ignore specific JSON paths during comparison) — required for #67
 - Text-mode policies (`always-local`, `always-remote`) for non-JSON files
 
-Until #337 is implemented, only `.canvas` files use semantic merge.
+Until #337 is implemented, `.canvas` is the only file type with structure-aware semantic merge. All other clashing files (including plain text and non-canvas JSON) are eligible for the line-based merge below.
+
+## Line-Based Text Merge
+
+A three-way line-level merge for everything else, using [`node-diff3`](https://github.com/bhousel/node-diff3): auto-merges a clash when local and remote changed different, non-adjacent lines. This covers edits anywhere in the file — different paragraphs, list insertions, unrelated sections — not just appends at the end. Anything that region-based diff3 can't cleanly separate (see below) falls back to the standard `_fit/` clash file, unchanged from before this feature existed.
+
+**Merge rule:** given `base` (fetched the same way as the canvas merge base — `lastFetchedRemoteShas[path]` blob SHA), `local`, and `remote`, split into lines and run `diff3Merge`:
+
+```typescript
+function tryLineMerge(base: string, local: string, remote: string): string | null {
+  if (local === remote) return local;
+  const regions = diff3Merge(local.split('\n'), base.split('\n'), remote.split('\n'), { excludeFalseConflicts: true });
+  if (regions.some(r => 'conflict' in r)) return null;
+  return regions.flatMap(r => r.ok ?? []).join('\n');
+}
+```
+
+Any conflicting region at all (even one, anywhere in the file) → the whole file falls back to `_fit/`, same policy as canvas's two-way fallback — there's no partial merge with inline `<<<<<<<`-style conflict markers written into the note; that would change Obsidian's editing UX and risk breaking embeds/links mid-file. `excludeFalseConflicts: true` (a `node-diff3` option) treats "both sides independently made the identical edit" as resolved rather than a conflict.
+
+**Adjacent-line limitation:** region-based diff3 groups *touching* changes (no unchanged line between them in `base`) into a single region. If local and remote each changed one of two directly adjacent lines, that counts as one region, and since its local/remote content differ, it's reported as a conflict — even though each side's edit is, on its own, independent. This matches standard `diff3`/`git merge-file` behavior; splitting a paragraph across more lines (or leaving a blank line between distinct edits) avoids it. Non-adjacent changes anywhere else in the file merge cleanly regardless of distance.
+
+**Binary files:** never merged. `.toPlainText()` throws on non-UTF-8 content (the same fatal-`TextDecoder` guard used elsewhere), and that throw is caught per-file, falling back to `_fit/` exactly like today — no separate binary/text check needed, since remote content always arrives base64-encoded regardless of underlying type (matching GitHub's blob API), so an encoding check can't distinguish binary from text on its own.
+
+**No base available:** (fetch failure, or first clash for a path with no prior sync) → not eligible, falls back to `_fit/`, same as canvas's two-way fallback.
+
+**Result:** merged content written to the local file, SHA stored in baseline, path excluded from `pendingClashes` — same observable behavior as a successful canvas merge.
+
+**Implementation:** [`src/util/lineMerge.ts`](../src/util/lineMerge.ts) (`tryLineMerge`), [`src/fitSync.ts`](../src/fitSync.ts) (base pre-fetch + auto-merge block, alongside the canvas merge block, before `clashFiles` computation)
 
 ## Explain Sync Status
 
